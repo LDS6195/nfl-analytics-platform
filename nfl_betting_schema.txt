@@ -1,0 +1,716 @@
+# NFL Betting Analytics Platform - Complete Build Guide
+
+## Project Overview
+A full-stack NFL betting analytics platform that surfaces betting odds alongside team statistics, advanced metrics, and situational data to help users make informed betting decisions. The platform tracks user bets to help identify personal biases and tendencies.
+
+**Tech Stack:**
+- Frontend: Next.js 14+ (App Router), React, TypeScript, Tailwind CSS, shadcn/ui
+- Backend: Next.js API routes
+- Database: PostgreSQL (via Supabase free tier)
+- Data Sources: The Odds API, ESPN API, Pro Football Reference
+- Deployment: Vercel (free tier)
+
+---
+
+## Database Schema
+
+### Core Tables
+
+```sql
+-- Teams table
+CREATE TABLE teams (
+  id SERIAL PRIMARY KEY,
+  external_id VARCHAR(50) UNIQUE NOT NULL, -- ESPN team ID
+  name VARCHAR(100) NOT NULL,
+  abbreviation VARCHAR(10) NOT NULL,
+  conference VARCHAR(10),
+  division VARCHAR(20),
+  logo_url TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Games table
+CREATE TABLE games (
+  id SERIAL PRIMARY KEY,
+  external_id VARCHAR(50) UNIQUE NOT NULL, -- ESPN game ID
+  season INTEGER NOT NULL,
+  week INTEGER NOT NULL,
+  game_date TIMESTAMP NOT NULL,
+  home_team_id INTEGER REFERENCES teams(id),
+  away_team_id INTEGER REFERENCES teams(id),
+  home_score INTEGER,
+  away_score INTEGER,
+  status VARCHAR(20), -- 'scheduled', 'in_progress', 'final'
+  venue VARCHAR(200),
+  weather_temp DECIMAL(5,2),
+  weather_condition VARCHAR(50),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_game UNIQUE(external_id)
+);
+
+-- Odds table (snapshot approach for line movement tracking)
+CREATE TABLE odds (
+  id SERIAL PRIMARY KEY,
+  game_id INTEGER REFERENCES games(id),
+  bookmaker VARCHAR(50) NOT NULL,
+  market_type VARCHAR(20) NOT NULL, -- 'spreads', 'totals', 'moneyline'
+  home_odds DECIMAL(10,2),
+  away_odds DECIMAL(10,2),
+  home_point DECIMAL(5,1), -- spread or total
+  away_point DECIMAL(5,1),
+  timestamp TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_odds_game ON odds(game_id);
+CREATE INDEX idx_odds_timestamp ON odds(timestamp);
+
+-- Team season stats (aggregate stats updated weekly)
+CREATE TABLE team_stats (
+  id SERIAL PRIMARY KEY,
+  team_id INTEGER REFERENCES teams(id),
+  season INTEGER NOT NULL,
+  week INTEGER NOT NULL,
+  
+  -- Basic offense
+  points_per_game DECIMAL(5,2),
+  total_yards_per_game DECIMAL(6,2),
+  pass_yards_per_game DECIMAL(6,2),
+  rush_yards_per_game DECIMAL(6,2),
+  
+  -- Basic defense
+  points_allowed_per_game DECIMAL(5,2),
+  total_yards_allowed_per_game DECIMAL(6,2),
+  pass_yards_allowed_per_game DECIMAL(6,2),
+  rush_yards_allowed_per_game DECIMAL(6,2),
+  
+  -- Efficiency
+  third_down_pct DECIMAL(5,2),
+  third_down_defense_pct DECIMAL(5,2),
+  red_zone_pct DECIMAL(5,2),
+  red_zone_defense_pct DECIMAL(5,2),
+  
+  -- Turnovers
+  turnovers_gained INTEGER,
+  turnovers_lost INTEGER,
+  turnover_differential INTEGER,
+  
+  -- Advanced (if available)
+  epa_per_play_offense DECIMAL(6,3),
+  epa_per_play_defense DECIMAL(6,3),
+  
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_team_week UNIQUE(team_id, season, week)
+);
+
+CREATE INDEX idx_team_stats_lookup ON team_stats(team_id, season, week);
+
+-- Home/Away splits
+CREATE TABLE team_splits (
+  id SERIAL PRIMARY KEY,
+  team_id INTEGER REFERENCES teams(id),
+  season INTEGER NOT NULL,
+  location VARCHAR(10) NOT NULL, -- 'home' or 'away'
+  
+  games_played INTEGER DEFAULT 0,
+  wins INTEGER DEFAULT 0,
+  losses INTEGER DEFAULT 0,
+  points_per_game DECIMAL(5,2),
+  points_allowed_per_game DECIMAL(5,2),
+  
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_team_split UNIQUE(team_id, season, location)
+);
+
+-- User bets tracking
+CREATE TABLE user_bets (
+  id SERIAL PRIMARY KEY,
+  user_id UUID, -- For future auth, nullable for now
+  game_id INTEGER REFERENCES games(id),
+  bet_type VARCHAR(20) NOT NULL, -- 'spread', 'moneyline', 'total_over', 'total_under'
+  team_id INTEGER REFERENCES teams(id), -- NULL for totals
+  odds DECIMAL(10,2) NOT NULL,
+  stake DECIMAL(10,2) NOT NULL,
+  potential_win DECIMAL(10,2),
+  result VARCHAR(20), -- 'pending', 'won', 'lost', 'push'
+  notes TEXT,
+  placed_at TIMESTAMP DEFAULT NOW(),
+  settled_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_bets_user ON user_bets(user_id);
+CREATE INDEX idx_user_bets_game ON user_bets(game_id);
+
+-- User bet analytics (computed/cached)
+CREATE TABLE user_bet_analytics (
+  id SERIAL PRIMARY KEY,
+  user_id UUID UNIQUE,
+  
+  total_bets INTEGER DEFAULT 0,
+  total_wins INTEGER DEFAULT 0,
+  total_losses INTEGER DEFAULT 0,
+  total_pushes INTEGER DEFAULT 0,
+  win_rate DECIMAL(5,2),
+  
+  total_staked DECIMAL(10,2) DEFAULT 0,
+  total_returned DECIMAL(10,2) DEFAULT 0,
+  net_profit DECIMAL(10,2) DEFAULT 0,
+  roi DECIMAL(5,2),
+  
+  -- Bias indicators
+  favorite_team_id INTEGER REFERENCES teams(id),
+  favorite_team_bet_count INTEGER DEFAULT 0,
+  favorite_team_win_rate DECIMAL(5,2),
+  
+  avg_stake DECIMAL(10,2),
+  biggest_win DECIMAL(10,2),
+  biggest_loss DECIMAL(10,2),
+  
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+---
+
+## API Endpoints Structure
+
+### Data Ingestion (Backend Cron Jobs)
+```
+POST /api/cron/fetch-odds         # Fetch current odds from The Odds API
+POST /api/cron/fetch-games         # Fetch schedule/scores from ESPN
+POST /api/cron/fetch-team-stats    # Fetch/calculate team statistics
+POST /api/cron/update-game-status  # Update live scores
+```
+
+### Public API Endpoints
+```
+GET /api/games                     # List games (with filters)
+  ?week=1&season=2024&team=PHI
+  
+GET /api/games/[gameId]           # Game details with odds & stats
+  Returns: game info, both teams' stats, current odds, line movement
+
+GET /api/teams                     # List all teams
+
+GET /api/teams/[teamId]           # Team details
+  Returns: team info, current season stats, home/away splits
+
+GET /api/teams/[teamId]/stats     # Historical stats by week
+  ?season=2024
+
+GET /api/odds/[gameId]            # Odds history for a game
+  Returns: line movement over time
+
+GET /api/matchup                   # Compare two teams
+  ?homeTeam=PHI&awayTeam=DAL&week=5
+  Returns: head-to-head stats, matchup analysis
+```
+
+### User Endpoints (Phase 3)
+```
+POST /api/bets                     # Track a new bet
+GET /api/bets                      # Get user's bets
+GET /api/bets/analytics            # Get user analytics/biases
+PATCH /api/bets/[betId]           # Update bet result
+```
+
+---
+
+## Phase 1: Prompt for Database & API Setup
+
+```
+I'm building an NFL betting analytics platform using Next.js 14, TypeScript, and PostgreSQL (via Supabase). 
+
+CONTEXT:
+- The platform surfaces NFL game odds alongside team statistics to help users make informed betting decisions
+- Data sources: The Odds API (for odds), ESPN API (for games/basic stats), Pro Football Reference (for advanced stats)
+- Users will track their bets to identify personal biases
+
+TASK:
+Set up the initial project with database connection and core API structure.
+
+REQUIREMENTS:
+1. Initialize a Next.js 14 project with TypeScript and App Router
+2. Set up Supabase PostgreSQL connection
+3. Create the following database schema (provide SQL):
+   - teams table (id, external_id, name, abbreviation, conference, division, logo_url)
+   - games table (id, external_id, season, week, game_date, home_team_id, away_team_id, home_score, away_score, status, venue)
+   - odds table (id, game_id, bookmaker, market_type, home_odds, away_odds, home_point, away_point, timestamp)
+   - team_stats table (all the stats listed in the schema above)
+   - team_splits table (home/away performance splits)
+   
+4. Create a /lib/db.ts file for database connection utilities using Supabase client
+5. Create Next.js API route: POST /api/cron/fetch-games that:
+   - Fetches current week's NFL games from ESPN API
+   - Inserts/updates games in the database
+   - Handles errors gracefully
+   - Returns summary of games added/updated
+
+6. Create API route: GET /api/games that:
+   - Accepts query params: week, season, team
+   - Returns list of games with basic info
+   - Includes proper TypeScript types
+
+NOTES:
+- Use environment variables for API keys and database connection
+- Include proper error handling
+- Use TypeScript for all code
+- Follow Next.js 14 best practices with App Router
+
+Please provide the complete code for items 3-6.
+```
+
+---
+
+## Phase 2: Prompt for Odds Integration
+
+```
+CONTEXT:
+I have an NFL betting analytics platform with a database containing teams and games. Now I need to integrate The Odds API to fetch and store betting lines.
+
+EXISTING SETUP:
+- Next.js 14 with TypeScript
+- PostgreSQL database with games and odds tables
+- The Odds API account with API key
+
+TASK:
+Create the odds fetching and storage system.
+
+REQUIREMENTS:
+1. Create /lib/odds-api.ts with functions to:
+   - Fetch current odds for NFL games from The Odds API
+   - Parse and normalize the response
+   - Handle rate limiting (500 requests/month on free tier)
+   
+2. Create API route: POST /api/cron/fetch-odds that:
+   - Fetches odds for all upcoming games (next 7 days)
+   - Stores snapshots in the odds table for line movement tracking
+   - Only fetches odds once per day per game (unless line moves significantly)
+   - Returns summary of odds updated
+   
+3. Create API route: GET /api/games/[gameId] that returns:
+   - Game details
+   - Both teams' current season stats
+   - Current odds from all bookmakers
+   - Best available odds (highlight)
+   
+4. Create API route: GET /api/odds/[gameId]/history that:
+   - Returns line movement over time
+   - Formats data for chart visualization
+   - Shows opening line vs current line
+
+5. Create utility functions in /lib/odds-utils.ts:
+   - calculateImpliedProbability(odds: number)
+   - findBestOdds(odds: Odds[])
+   - detectLineMovement(historicalOdds: Odds[])
+
+NOTES:
+- The Odds API returns American odds format (-110, +150, etc.)
+- Store odds snapshots with timestamps for line movement analysis
+- Cache API responses appropriately
+- Handle cases where odds aren't available yet
+
+API Response format from The Odds API:
+{
+  "id": "game_id",
+  "home_team": "Philadelphia Eagles",
+  "away_team": "Dallas Cowboys",
+  "bookmakers": [
+    {
+      "key": "fanduel",
+      "markets": [
+        {
+          "key": "spreads",
+          "outcomes": [
+            {"name": "Philadelphia Eagles", "price": -110, "point": -3.5},
+            {"name": "Dallas Cowboys", "price": -110, "point": 3.5}
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+Please provide complete TypeScript code.
+```
+
+---
+
+## Phase 3: Prompt for Team Stats & Analytics
+
+```
+CONTEXT:
+NFL betting platform with games and odds data. Need to add team statistics and advanced analytics.
+
+TASK:
+Build the team statistics system that powers matchup analysis.
+
+REQUIREMENTS:
+1. Create /lib/stats-calculator.ts with functions to:
+   - Calculate season-to-date team statistics from game data
+   - Compute home/away splits
+   - Calculate trends (last 3 games, last 5 games)
+   
+2. Create API route: POST /api/cron/fetch-team-stats that:
+   - Fetches basic team stats from ESPN API
+   - Calculates derived stats (EPA if possible, efficiency metrics)
+   - Updates team_stats table
+   - Updates team_splits table
+   
+3. Create API route: GET /api/matchup that:
+   - Accepts: homeTeam, awayTeam, week parameters
+   - Returns comprehensive matchup analysis:
+     * Side-by-side stat comparison
+     * Strength vs weakness matchups (e.g., "Strong pass offense vs weak pass defense")
+     * Historical head-to-head (if available)
+     * Key factors (home/away splits, rest days, weather if relevant)
+     * Suggested "edges" or mismatches
+     
+4. Create /lib/matchup-analyzer.ts with functions:
+   - compareTeamStats(homeStats, awayStats)
+   - identifyMismatches(homeTeam, awayTeam)
+   - calculateMatchupScore(various factors)
+
+5. Update GET /api/games/[gameId] to include:
+   - Matchup analysis
+   - Key stats comparison
+   - Situational factors
+
+STATS TO TRACK:
+- Points per game (offense/defense)
+- Yards per game (total, pass, rush for both offense/defense)
+- Third down conversion % (offense/defense)
+- Red zone efficiency % (offense/defense)
+- Turnover differential
+- Home/Away splits for all above
+
+ADVANCED (if time permits):
+- EPA per play estimates
+- Pace of play
+- Success rate
+
+OUTPUT FORMAT for matchup endpoint:
+{
+  "game": {...},
+  "homeTeam": {...stats...},
+  "awayTeam": {...stats...},
+  "mismatches": [
+    {
+      "category": "Pass Offense vs Pass Defense",
+      "advantage": "away",
+      "strength": "significant",
+      "description": "Away team ranks 3rd in pass yards/game vs home team's 28th ranked pass defense"
+    }
+  ],
+  "keyFactors": [...],
+  "odds": {...}
+}
+
+Please provide complete TypeScript code.
+```
+
+---
+
+## Phase 4: Prompt for Frontend - Game Listing
+
+```
+CONTEXT:
+NFL betting analytics platform backend is complete. Now building the user-facing Next.js frontend.
+
+TASK:
+Create the main games listing page with filters and sorting.
+
+REQUIREMENTS:
+1. Create /app/page.tsx - Main dashboard showing:
+   - Current week's games by default
+   - Week selector (weeks 1-18)
+   - Date filter (today, tomorrow, this week)
+   - Team filter dropdown
+   - Sort options (by date, by spread, by total)
+   
+2. Create /components/GameCard.tsx that displays:
+   - Team logos and names
+   - Game date/time
+   - Current spread and total (best odds)
+   - Quick stats preview (records, points per game)
+   - "View Analysis" button
+   
+3. Create /components/WeekSelector.tsx
+   - Allows navigation between weeks
+   - Shows current week highlighted
+   - Quick jump to today's games
+   
+4. Create /lib/api-client.ts
+   - Typed fetch functions for all API endpoints
+   - Error handling
+   - Loading states
+
+5. Use Tailwind CSS and shadcn/ui components for:
+   - Professional, clean design
+   - Responsive layout (mobile-first)
+   - Dark mode support
+   - Loading skeletons
+
+DESIGN NOTES:
+- Primary color: NFL blue (#013369)
+- Use card-based layout for games
+- Show odds in American format with green/red indicators
+- Display team records prominently
+- Make it scannable - users should quickly see spreads and totals
+
+EXAMPLE GAME CARD LAYOUT:
+```
+┌─────────────────────────────────────┐
+│ Sun 1:00 PM                         │
+│                                     │
+│  Eagles (8-2)    @    Cowboys (6-4) │
+│  [logo]                [logo]       │
+│                                     │
+│  Spread: PHI -3.5 (-110)           │
+│  Total: 47.5                        │
+│  PPG: 28.5              24.1        │
+│                                     │
+│  [View Full Analysis] button        │
+└─────────────────────────────────────┘
+```
+
+Please provide complete React/TypeScript code with Tailwind styling.
+```
+
+---
+
+## Phase 5: Prompt for Frontend - Game Analysis Page
+
+```
+CONTEXT:
+Building detailed game analysis page for NFL betting platform.
+
+TASK:
+Create comprehensive game detail page with stats, odds, and matchup analysis.
+
+REQUIREMENTS:
+1. Create /app/games/[gameId]/page.tsx that displays:
+   - Game header (teams, date, venue, weather if available)
+   - Odds comparison table (all bookmakers, highlight best odds)
+   - Line movement chart (spread over time)
+   - Team stats side-by-side comparison
+   - Matchup analysis (strengths vs weaknesses)
+   - Key factors section
+   - Recent form (last 5 games for each team)
+   
+2. Create /components/OddsComparison.tsx:
+   - Table showing spread, moneyline, total for each bookmaker
+   - Highlight best available odds
+   - Show line movement (↑↓ indicators)
+   
+3. Create /components/LineMovementChart.tsx:
+   - Line chart showing spread changes over time
+   - Mark opening line vs current line
+   - Use recharts library
+   
+4. Create /components/StatsComparison.tsx:
+   - Side-by-side team stats with visual bars
+   - Color coding (green for advantage, red for disadvantage)
+   - Show rankings (e.g., "3rd in NFL")
+   
+5. Create /components/MatchupInsights.tsx:
+   - List of identified mismatches
+   - Strength indicators (significant, moderate, slight)
+   - Explanatory text for each insight
+   
+6. Create /components/KeyFactors.tsx:
+   - Bullet points of important context:
+     * Home/away performance
+     * Rest days
+     * Injury implications (if tracked)
+     * Weather impact
+     * Divisional matchup notes
+
+LAYOUT STRUCTURE:
+- Hero section: Game header with teams
+- Odds section: Current lines + line movement chart
+- Analysis section: Stats comparison + matchup insights
+- Context section: Key factors + recent form
+
+INTERACTION:
+- Clicking on a team opens team detail page
+- Hovering on stat shows NFL ranking
+- "Track Bet" button opens modal (Phase 6)
+
+Please provide complete React/TypeScript code with Tailwind and shadcn/ui components.
+```
+
+---
+
+## Phase 6: Prompt for Bet Tracking System
+
+```
+CONTEXT:
+NFL betting platform needs user bet tracking to help identify biases.
+
+TASK:
+Build bet tracking and personal analytics system.
+
+REQUIREMENTS:
+1. Create /app/bets/page.tsx - Bet tracking dashboard showing:
+   - List of user's bets (active, won, lost)
+   - Quick stats (win rate, ROI, total profit/loss)
+   - Filter by status, bet type, date range
+   - "Add Bet" button
+   
+2. Create /components/AddBetModal.tsx:
+   - Form to log a bet:
+     * Select game (dropdown of upcoming games)
+     * Bet type (spread, moneyline, over, under)
+     * Team selection (if applicable)
+     * Odds (American format)
+     * Stake amount
+     * Notes (optional)
+   - Calculate potential win automatically
+   - Submit to POST /api/bets
+   
+3. Create /app/bets/analytics/page.tsx - Personal analytics:
+   - Overall performance metrics
+   - Bias detection:
+     * Favorite team overconfidence (win rate on favorite team vs others)
+     * Bet type performance (spreads vs totals vs moneyline)
+     * Home/road bias
+     * Favorite vs underdog tendencies
+   - Charts showing performance over time
+   - Biggest wins and losses
+   
+4. Create backend API routes:
+   - POST /api/bets - Create new bet
+   - GET /api/bets - List user's bets with filters
+   - PATCH /api/bets/[betId] - Update bet (mark as won/lost)
+   - GET /api/bets/analytics - Calculate and return analytics
+   
+5. Create /lib/bet-analytics.ts:
+   - calculateWinRate(bets)
+   - calculateROI(bets)
+   - detectBiases(bets, userFavoriteTeam)
+   - generateInsights(analytics)
+
+ANALYTICS TO SURFACE:
+- Win rate overall and by bet type
+- ROI (return on investment)
+- Average stake
+- Profit/loss over time
+- Bias warnings:
+  * "You bet on [Team] 8 times with only 37.5% win rate"
+  * "Your underdog bets have 65% win rate vs 48% on favorites"
+  * "You're 8-2 on home teams but 3-7 on road teams"
+
+UI/UX NOTES:
+- Use green/red color coding for wins/losses
+- Show profit in currency format ($150.00)
+- Display odds in American format
+- Auto-update bet status when games finish (future enhancement)
+- Make insights actionable and non-judgmental
+
+Please provide complete React/TypeScript code for frontend and API routes.
+```
+
+---
+
+## Deployment & Final Steps
+
+### Deployment Prompt
+
+```
+CONTEXT:
+NFL betting platform is built and ready to deploy.
+
+TASK:
+Deploy to Vercel and set up cron jobs for data fetching.
+
+REQUIREMENTS:
+1. Deploy Next.js app to Vercel:
+   - Connect GitHub repository
+   - Set environment variables (DATABASE_URL, ODDS_API_KEY, etc.)
+   - Configure build settings
+   
+2. Set up Vercel Cron Jobs:
+   - Daily at 6 AM: fetch-odds
+   - Daily at 7 AM: fetch-games
+   - Daily at 8 AM: fetch-team-stats
+   - Every hour during game days: update-game-status
+   
+3. Create /vercel.json configuration file
+
+4. Set up monitoring:
+   - Error tracking for API failures
+   - Usage monitoring for API rate limits
+   
+5. Create README.md with:
+   - Project description
+   - Setup instructions
+   - Environment variables needed
+   - API documentation
+   - Tech stack overview
+
+Please provide:
+- vercel.json configuration
+- Deployment checklist
+- Environment variables list
+- README.md template
+```
+
+---
+
+## Future Enhancements (Post-MVP)
+
+- User authentication (Clerk or NextAuth)
+- Email/SMS alerts for line movements
+- Public betting percentages integration
+- Injury report tracking
+- Weather API integration
+- Machine learning predictions (stretch goal)
+- Mobile app (React Native)
+- Affiliate links to sportsbooks
+- Social features (share picks, leaderboards)
+
+---
+
+## Cost Breakdown
+
+| Service | Tier | Monthly Cost |
+|---------|------|--------------|
+| Vercel | Hobby | $0 |
+| Supabase | Free | $0 |
+| The Odds API | Rookie | $99 |
+| Domain (optional) | - | ~$12/year |
+| **Total** | | **~$99/month** |
+
+---
+
+## Development Timeline
+
+| Phase | Estimated Time | Description |
+|-------|----------------|-------------|
+| Phase 1 | 2-3 days | Database & API setup |
+| Phase 2 | 2-3 days | Odds integration |
+| Phase 3 | 2-3 days | Stats & analytics |
+| Phase 4 | 3-4 days | Game listing UI |
+| Phase 5 | 3-4 days | Analysis page UI |
+| Phase 6 | 3-4 days | Bet tracking |
+| Testing/Polish | 2-3 days | Bug fixes, refinement |
+| **Total** | **3-4 weeks** | Full MVP |
+
+---
+
+## Key Learning Outcomes
+
+This project will teach you:
+- **Backend:** API design, database modeling, cron jobs, data pipelines
+- **Frontend:** Next.js App Router, React components, state management, data visualization
+- **Full Stack:** API integration, authentication (later), deployment, monitoring
+- **Data Engineering:** ETL processes, data normalization, caching strategies
+- **Product:** Building for real users, feature prioritization, UX design
+
+This is production-ready portfolio material that demonstrates hireable skills.
