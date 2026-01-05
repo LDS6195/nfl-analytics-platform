@@ -6,10 +6,21 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
+    // Check if a specific week was requested
+    const { searchParams } = new URL(request.url);
+    const requestedWeek = searchParams.get('week');
+    
+    let url = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard';
+    
+    // If week specified, add it to the URL
+    if (requestedWeek) {
+      url += `?dates=2025&seasontype=2&week=${requestedWeek}`;
+    }
+    
+    console.log('Fetching from ESPN:', url);
+    
     // 1. Fetch data from ESPN NFL Scoreboard
-    const response = await fetch(
-      'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard'
-    );
+    const response = await fetch(url);
     
     console.log('ESPN API Response Status:', response.status);
     
@@ -21,8 +32,8 @@ export async function POST(request: Request) {
     console.log('ESPN Data received, events count:', data.events?.length);
     
     const events = data.events || [];
-    const seasonYear = data.season.year;
-    const weekNumber = data.week.number;
+    const seasonYear = 2025; // Force 2025 season
+    const weekNumber = requestedWeek ? parseInt(requestedWeek) : (data.week?.number || 18);
 
     let gamesProcessed = 0;
     let teamsProcessed = 0;
@@ -66,8 +77,8 @@ export async function POST(request: Request) {
         game_date: event.date,
         home_team_id: homeTeamId,
         away_team_id: awayTeamId,
-        home_score: parseInt(homeComp.score),
-        away_score: parseInt(awayComp.score),
+        home_score: parseInt(homeComp.score) || 0,
+        away_score: parseInt(awayComp.score) || 0,
         status: event.status.type.state,
         venue: competition.venue?.fullName || 'Unknown',
         updated_at: new Date().toISOString()
